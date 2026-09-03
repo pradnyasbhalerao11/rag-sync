@@ -1,0 +1,7 @@
+data/*.jsonl
+target/
+.idea/
+*.iml
+__pycache__/
+.env
+.DS_Store

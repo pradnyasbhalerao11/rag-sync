@@ -1,7 +1,8 @@
-data/*.jsonl
+data/
 target/
 .idea/
 *.iml
 __pycache__/
+.venv/
 .env
 .DS_Store

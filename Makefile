@@ -1,10 +1,10 @@
-REPO    ?= ../spring-boot-docs
+REPO    ?= ../vuejs-docs
 PATHSPEC?= *.md
 TOPIC   ?= doc.changes
 PARTS   ?= 6
 MVN     ?= mvn
 
-.PHONY: up down topic extract publish stats reset logs clean
+.PHONY: up down topic extract export publish consumer test stats reset logs clean all
 
 up:
 	docker compose up -d
@@ -23,9 +23,16 @@ topic:
 	docker exec rag-kafka /opt/kafka/bin/kafka-topics.sh --describe \
 		--bootstrap-server localhost:9092 --topic $(TOPIC)
 
+audit:
+	python3 tools/audit_corpus.py --repo $(REPO) --pathspec '$(PATHSPEC)'
+
 extract:
 	python3 tools/extract_events.py --repo $(REPO) --pathspec '$(PATHSPEC)' \
 		--out data/events.jsonl
+
+export:
+	python3 tools/export_blobs.py --repo $(REPO) --events data/events.jsonl \
+		--out data/blobs
 
 publish:
 	python3 tools/publish_events.py --file data/events.jsonl --topic $(TOPIC)
@@ -46,4 +53,4 @@ logs:
 	docker compose logs -f kafka
 
 clean:
-	rm -f data/events.jsonl
+	rm -rf data/events.jsonl data/blobs

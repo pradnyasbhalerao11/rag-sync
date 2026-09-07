@@ -3,6 +3,12 @@ server:
 
 app:
   topic: doc.changes
+  # Resolved relative to the working directory. IntelliJ runs with the working
+  # directory set to the project root, so this points at rag-sync/data/blobs.
+  blob-dir: data/blobs
+  chunk:
+    target-size: 1000
+    max-size: 1500
 
 spring:
   application:
@@ -10,7 +16,7 @@ spring:
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
-      group-id: ingest-consumer-v1
+      group-id: ingest-consumer-v2
       auto-offset-reset: earliest
       # manual commits only: the offset moves when we say the work is done,
       # not when the poll loop happens to come around again
@@ -30,5 +36,5 @@ spring:
 
 logging:
   level:
-    com.example.ingest: INFO
+    com.ragsync.ingest: INFO
     org.apache.kafka: WARN

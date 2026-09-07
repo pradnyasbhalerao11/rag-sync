@@ -10,9 +10,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * This holds only because the producer keys by doc_id, so all events for one
  * document land on one partition, and one partition is consumed by one thread.
- * If someone later "helpfully" changes the partitioning key or reprocesses out
- * of band, this counter goes non-zero and you find out immediately instead of
- * six weeks later via a wrong answer in production.
+ * If someone later changes the partitioning key or reprocesses out of band,
+ * this counter goes non-zero and you find out immediately instead of six weeks
+ * later via a wrong answer in production.
  */
 public class OrderingTracker {
 

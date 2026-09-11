@@ -1,9 +1,8 @@
 package com.ragsync.ingest.consumer;
 
 import com.ragsync.ingest.blob.BlobStore;
-import com.ragsync.ingest.chunk.Chunk;
-import com.ragsync.ingest.chunk.ChunkHasher;
-import com.ragsync.ingest.chunk.Chunker;
+import com.ragsync.ingest.chunk.ChunkPipeline;
+import com.ragsync.ingest.chunk.HashedChunk;
 import com.ragsync.ingest.chunk.SeenChunks;
 import com.ragsync.ingest.model.DocChangeEvent;
 import com.ragsync.ingest.stats.ReplayStats;
@@ -17,12 +16,11 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * Week 2: resolve each upsert to its document text, chunk it, and decide which
- * chunks are actually new.
+ * Still no embeddings and no index — this week only decides what WOULD be
+ * embedded, and counts it.
  *
- * Still no embeddings and no index. The point of doing it in this order is that
- * the skip logic exists before anything expensive depends on it, so the slow
- * version of this pipeline never gets written.
+ * Building the skip logic before anything expensive depends on it means the
+ * slow version of this pipeline never gets written.
  */
 @Component
 public class DocChangeConsumer {
@@ -31,16 +29,16 @@ public class DocChangeConsumer {
 
     private final ReplayStats stats;
     private final BlobStore blobStore;
-    private final Chunker chunker;
+    private final ChunkPipeline pipeline;
     private final SeenChunks seenChunks;
 
     public DocChangeConsumer(ReplayStats stats,
                              BlobStore blobStore,
-                             Chunker chunker,
+                             ChunkPipeline pipeline,
                              SeenChunks seenChunks) {
         this.stats = stats;
         this.blobStore = blobStore;
-        this.chunker = chunker;
+        this.pipeline = pipeline;
         this.seenChunks = seenChunks;
     }
 
@@ -59,7 +57,7 @@ public class DocChangeConsumer {
 
         try {
             if (event.isDelete()) {
-                handleDelete(event);
+                seenChunks.forget(event.docId());
             } else {
                 handleUpsert(event);
             }
@@ -73,39 +71,40 @@ public class DocChangeConsumer {
         ack.acknowledge();
     }
 
-    private void handleDelete(DocChangeEvent event) {
-        int forgotten = seenChunks.forget(event.docId());
-        if (log.isDebugEnabled()) {
-            log.debug("delete {} dropped {} chunk hashes", event.docId(), forgotten);
-        }
-    }
-
     private void handleUpsert(DocChangeEvent event) {
-        String markdown = blobStore.read(event.contentHash());
-        if (markdown == null) {
+        String raw = blobStore.read(event.contentHash());
+        if (raw == null) {
             stats.recordBlobMiss();
             return;
         }
 
-        List<Chunk> chunks = chunker.chunk(markdown);
+        List<HashedChunk> chunks = pipeline.process(raw, event.docId());
 
-        int newCount = 0;
-        int reusedCount = 0;
-        for (Chunk chunk : chunks) {
-            String chunkHash = ChunkHasher.sha256(chunk.text());
-            if (seenChunks.markSeen(event.docId(), chunkHash)) {
-                newCount++;
-                // week 3: this is where the embedding call goes
+        int rowsToWrite = 0;
+        int embeddingsNeeded = 0;
+        int unchanged = 0;
+        int vectorsReused = 0;
+
+        for (HashedChunk chunk : chunks) {
+            if (!seenChunks.markContentSeen(event.docId(), chunk.contentHash())) {
+                unchanged++;                       // identical row already present
+                continue;
+            }
+            rowsToWrite++;
+
+            if (seenChunks.markEmbedSeen(event.docId(), chunk.embedHash())) {
+                embeddingsNeeded++;                // week 3: the API call goes here
             } else {
-                reusedCount++;
+                vectorsReused++;                   // same text, different links
             }
         }
 
-        stats.recordChunks(newCount, reusedCount);
+        stats.recordChunks(embeddingsNeeded, unchanged + vectorsReused);
+        stats.recordRows(rowsToWrite, vectorsReused);
 
         if (log.isDebugEnabled()) {
-            log.debug("{} -> {} chunks ({} new, {} reused)",
-                    event.docId(), chunks.size(), newCount, reusedCount);
+            log.debug("{} -> {} chunks ({} embed, {} vector-reuse, {} unchanged)",
+                    event.docId(), chunks.size(), embeddingsNeeded, vectorsReused, unchanged);
         }
     }
 }

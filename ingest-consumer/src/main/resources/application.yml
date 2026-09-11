@@ -9,6 +9,13 @@ app:
   chunk:
     target-size: 1000
     max-size: 1500
+  normalize:
+    # A URL fragment or query must be at least this long AND almost entirely
+    # encoding-alphabet characters before it is treated as opaque. Both
+    # conditions, deliberately: "looks like base64" alone would catch JWTs,
+    # hashes and legitimate encoding examples.
+    opaque-fragment-threshold: 200
+    encoded-ratio: 0.95
 
 spring:
   application:
@@ -16,7 +23,7 @@ spring:
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
-      group-id: ingest-consumer-v2
+      group-id: ingest-consumer-v3
       auto-offset-reset: earliest
       # manual commits only: the offset moves when we say the work is done,
       # not when the poll loop happens to come around again

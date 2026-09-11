@@ -34,6 +34,8 @@ public class ReplayStats {
     private final AtomicLong chunksReused = new AtomicLong();
     private final AtomicLong blobMisses = new AtomicLong();
     private final AtomicLong documentsChunked = new AtomicLong();
+    private final AtomicLong rowsWritten = new AtomicLong();
+    private final AtomicLong vectorsReused = new AtomicLong();
 
     private volatile long firstEventAtMillis = 0L;
     private volatile long lastEventAtMillis = 0L;
@@ -58,6 +60,16 @@ public class ReplayStats {
 
     public void recordBlobMiss() {
         blobMisses.incrementAndGet();
+    }
+
+    /**
+     * rowsToWrite  index rows that need writing (content changed)
+     * vectorReuse  of those, how many skipped the embedding API because an
+     *              identical normalized text already had a vector
+     */
+    public void recordRows(int rowsToWrite, int vectorReuse) {
+        rowsWritten.addAndGet(rowsToWrite);
+        vectorsReused.addAndGet(vectorReuse);
     }
 
     public void recordChunks(int newCount, int reusedCount) {
@@ -90,6 +102,8 @@ public class ReplayStats {
                 chunks,
                 chunksNew.get(),
                 chunksReused.get(),
+                rowsWritten.get(),
+                vectorsReused.get(),
                 Math.round(reuseRate * 1000) / 1000.0,
                 blobMisses.get(),
                 elapsedMillis);
@@ -105,6 +119,8 @@ public class ReplayStats {
         chunksTotal.set(0);
         chunksNew.set(0);
         chunksReused.set(0);
+        rowsWritten.set(0);
+        vectorsReused.set(0);
         blobMisses.set(0);
         documentsChunked.set(0);
         firstEventAtMillis = 0L;
@@ -122,6 +138,8 @@ public class ReplayStats {
             long chunksTotal,
             long chunksNew,
             long chunksReused,
+            long rowsWritten,
+            long vectorsReusedAcrossLinks,
             double reuseRate,
             long blobMisses,
             long elapsedMillis) {

@@ -2,183 +2,195 @@
 
 Keeps a RAG vector index in sync with a document corpus that keeps changing.
 
-Most RAG systems index their documents once and never think about it again. Then
-the documents change — edited, deleted, renamed — and the index quietly stops
-matching reality. It still returns results. The results are just wrong, and
-nothing tells you.
+Most RAG systems index once and stop. Then documents get edited, deleted and
+renamed, and the index quietly stops matching reality. It still returns results.
+The results are just wrong, and nothing tells you.
 
-This is the write path for a RAG system: the part that notices changes and
-applies them correctly.
+This is the write path: the part that notices a change and applies it correctly.
 
 ---
 
-## The failure modes this exists to prevent
+## Failure modes it exists to prevent
 
-**Orphaned chunks.** A 4,000-word document splits into 12 chunks. It gets
-rewritten and now splits into 9. Upsert the 9 and chunks 10–12 from the old
-version stay in the index forever, still retrievable, still cited.
-
-**Deletes that don't propagate.** A document is removed from the source. Its
-embeddings remain. If that document held a revoked policy or personal data, this
-is a compliance problem rather than a quality one.
-
-**Embedding model skew.** Upgrade the embedding model and old vectors sit in a
-different space to new ones. Similarity scores between them become noise. You
-need to know which model produced every vector and be able to re-embed without
-downtime.
-
-**Poison documents.** One malformed file throws in the consumer, the partition
-stalls, and every document behind it stops indexing silently.
-
-All four are ordinary backend correctness problems. Almost none of the AI
-engineering content online addresses any of them.
+- **Orphaned chunks** — a 12-chunk document is rewritten into 9; upsert the 9 and
+  chunks 10–12 stay retrievable forever
+- **Deletes that don't propagate** — source document removed, embeddings remain
+- **Embedding model skew** — new vectors land in a different space from old ones
+- **Poison documents** — one bad file stalls a Kafka partition silently
 
 ---
 
-## Status: week 1 of 6
+## Status
 
-This repo is being built in public, one increment per week.
-
-- [x] **Week 1** — change events extracted from real git history, published to
-      Kafka, consumed in order, counted
-- [ ] **Week 2** — chunking, content-hash dedupe, skip unchanged chunks
-- [ ] **Week 3** — embeddings via Microsoft Foundry, upsert into the index
-- [ ] **Week 4** — delete propagation, orphan sweep, idempotent replay
-- [ ] **Week 5** — dead-letter topic, reconciler, drift report
-- [ ] **Week 6** — embedding model migration by topic replay, before/after
-      numbers
-
-Week 1 deliberately does no work. Before spending money on embedding calls, the
-transport has to be provably correct: if a delete can overtake an upsert, you
-delete a document that was about to be correctly indexed, and you would never
-find that bug with embedding calls and index writes in the way.
-
----
-
-## Where the test data comes from
-
-Synthetic change events are too clean. Real documentation repositories are
-already a recording of a folder changing over years — genuine edits, deletions
-and renames, with timestamps.
-
-`tools/extract_events.py` replays a repository's commit log as a change event
-stream. It uses `git log --raw`, which returns the blob SHA of every file
-version, so content hashes come free: git already computed them, and identical
-content always produces an identical SHA.
-
-Running it against the Vue.js documentation repo:
-
-```
-events=3726  upserts=3499  deletes=227
-distinct_docs=347  ordering_violations=0
-avg_edits_per_doc=10.7
-```
-
-347 distinct paths across history against 122 files at HEAD. Roughly two thirds
-of the documents this corpus ever contained were later deleted or moved. That
-gap is the entire reason this project exists.
-
-`tools/audit_corpus.py` scores any repository on whether it will actually
-exercise the pipeline — a corpus where nothing is ever deleted can never
-surface the orphaned-chunk bug.
+- [x] Event transport — git history → Kafka, ordered per document
+- [x] Chunking and dedupe — parse, normalize, chunk, content-hash
+- [ ] Embeddings and vector index
+- [ ] Delete propagation and orphan sweep
+- [ ] Dead-letter topic and reconciler
+- [ ] Embedding model migration by replay
 
 ---
 
 ## Architecture
 
 ```
-  Documents            Sync layer (this repo)              Index
- +----------+      +---------------------------+      +------------+
- | git repo |----->|  doc.changes topic        |      |  vectors + |
- |  (source |      |  keyed by document path   |----->|   chunks   |
- | of truth)|      |           |               |      |            |
- +----------+      |           v               |      +------------+
-                   |  ingestion consumer       |             |
-                   +---------------------------+             v
-                                                       +------------+
-                                                       |  RAG app   |
-                                                       | (not here) |
-                                                       +------------+
+  git repo
+     │  extract_events.py          export_blobs.py
+     ▼                                    │
+  doc.changes  (Kafka, keyed by doc path) │
+     │                                    ▼
+     ▼                              data/blobs/  (content-addressed)
+  ┌──────────────────────────────────────────────┐
+  │  ingest consumer                             │
+  │                                              │
+  │   parse       DocumentParsers ──┐            │
+  │                                 ├─ .md → MarkdownParser
+  │                                 └─ *  → passthrough
+  │      ▼                                       │
+  │   normalize   OpaqueUrlNormalizer            │
+  │                  opaque URL → §link0§        │
+  │                  original kept in metadata   │
+  │      ▼                                       │
+  │   chunk       Chunker                        │
+  │                  headings → paragraphs → cap │
+  │      ▼                                       │
+  │   hash        embedHash   = text             │
+  │               contentHash = text + links     │
+  └──────────────────────────────────────────────┘
+     │
+     ▼
+  vector index  →  RAG app (out of scope)
 ```
 
-The retrieval side is deliberately out of scope. This is infrastructure —
-nothing sits above it that a user logs into.
+---
+
+## From markdown-specific to pluggable
+
+The first chunker knew exactly one rule: split on markdown `#` headings. Running
+it against other corpora showed the limit — **28 of 138 Prometheus docs and 29 of
+150 JUnit Java files have no headings at all**, so each became a single chunk and
+fell through to a blind character cut.
+
+The fix was not a smarter markdown chunker. It was a seam:
+
+```
+DocumentParsers.extractText(raw, path)
+        ├── .md  → MarkdownParser   (strips frontmatter)
+        └── else → passthrough
+```
+
+Adding PDF or HTML later means adding one `DocumentParser`, not editing the
+chunker. The block-model abstraction is deliberately deferred until a second
+format actually needs it.
+
+---
+
+## Parsing and normalization
+
+Two stages run **before** chunking.
+
+**Parse** — what is the text in this file? For markdown, strip the YAML
+frontmatter; `title: X / outline: deep` is metadata, not prose.
+
+**Normalize** — what should the embedding model see? The corpus contains
+generated permalinks up to **2,655 characters**, entirely base64 on one line. The
+chunker had nothing to split them on, so it hard-cut at the size cap and emitted
+fragments like `XG4gICAgPlxuICAgICAge3sgaXRlbS5tc2c`. Those embed without error,
+cost real money, and produce meaningless vectors that can still be the nearest
+match to a user's query.
+
+Detection requires all three conditions, deliberately:
+
+1. it is a URL
+2. its fragment or query is ≥ 200 characters
+3. that payload is ≥ 95% encoding-alphabet characters, no spaces
+
+"Looks like base64" alone would catch JWTs, hashes and encoding examples. A
+base64 blob in a paragraph is untouched — it isn't a URL.
+
+**Nothing is deleted.** The original URL travels with the chunk as metadata, so a
+retrieved chunk still presents a working link. Only the embedding representation
+changes.
+
+---
+
+## Two hashes
+
+```
+embedHash   = sha256(normalized text)               → need a new vector?
+contentHash = sha256(normalized text + links)       → need to rewrite the row?
+```
+
+| what changed | embedHash | contentHash | cost |
+|---|---|---|---|
+| prose | changes | changes | embed + write |
+| only a URL | same | changes | write row, **reuse vector** |
+
+Neither hash includes chunk position. If it did, inserting a paragraph at the top
+of a document would make every chunk below look changed, collapsing reuse on
+exactly the edits where it matters most.
+
+---
+
+## Results — full replay of vuejs/docs
+
+```json
+{
+  "totalEvents": 3726,
+  "distinctDocuments": 347,
+  "orderingViolations": 0,
+  "chunksTotal": 47760,
+  "chunksNew": 10676,
+  "reuseRate": 0.776,
+  "vectorsReusedAcrossLinks": 146,
+  "blobMisses": 0
+}
+```
+
+**`orderingViolations: 0`** across 347 documents — every document's edits, renames
+and deletes applied in commit order.
+
+**`reuseRate: 0.776`** — 37,084 of 47,760 chunks were byte-identical to one
+already seen, so 78% of embedding work is avoidable.
+
+Normalization cut chunks from 52,255 to 47,760 and embedding calls from 11,239 to
+10,676, keeping ~470 base64 vectors out of the index entirely.
 
 ---
 
 ## Running it
 
-Requires Docker, Java 17+, Maven, Python 3.10+.
-
 ```bash
-conda create -n ragsync python=3.12 -y && conda activate ragsync
+conda activate ragsync
 pip install -r tools/requirements.txt
-
 git clone https://github.com/vuejs/docs ../vuejs-docs
-python3 tools/audit_corpus.py --repo ../vuejs-docs   # should say "good corpus"
 
-make up                              # Kafka in KRaft mode, plus UI on :8081
-make topic                           # doc.changes, 6 partitions
-make extract REPO=../vuejs-docs      # git history -> data/events.jsonl
-make consumer                        # Spring Boot, blocks
-make publish                         # in another shell
+make test                          # 30 unit tests, no infrastructure
+make up && make topic
+make extract REPO=../vuejs-docs    # git history → data/events.jsonl
+make export  REPO=../vuejs-docs    # document bytes → data/blobs/
+make consumer                      # Spring Boot, blocks
+make publish                       # another shell
 make stats
 ```
 
-`make stats` returns:
-
-```json
-{
-  "totalEvents": 3726,
-  "eventsByOp": { "delete": 227, "upsert": 3499 },
-  "distinctDocuments": 347,
-  "eventsByPartition": { "0": 813, "1": 828, "2": 496, "3": 509, "4": 554, "5": 526 },
-  "orderingViolations": 0,
-  "deserializationFailures": 0
-}
-```
-
-`orderingViolations: 0` across 347 documents is the result week 1 exists to
-produce.
----
-
-## Design notes
-
-**Events are keyed by document path.** All events for one document therefore
-land on one partition, and one partition is consumed by one thread, so a
-document's events are always processed in commit order. This single producer
-config line is what makes everything downstream possible.
-
-**Ordering is asserted at runtime, not assumed.** `OrderingTracker` holds the
-last sequence number seen per document and requires each new one to be strictly
-greater. If the partitioning key changes, or a rebalance reprocesses records,
-`orderingViolations` goes non-zero immediately rather than surfacing months
-later as a wrong answer.
-
-**Manual offset commits.** Auto-commit is off. The offset moves when the work is
-done, not when the poll loop comes around again. Right now "done" means counted;
-from week 3 it will mean written to the index, and that distinction is the
-difference between at-least-once and at-most-once delivery.
-
-**Renames expand into two events.** Git records a rename as one operation.
-The extractor emits a delete of the old path and an upsert of the new one.
-Handle only the upsert and the index ends up holding two copies of the same
-document, one filed under a path that no longer exists.
-
-**Deterministic event ids.** `{commit}:{path}:{op}`. Replaying the same history
-produces identical ids, which is what makes week 4's idempotency test possible
-without extra machinery.
+Re-running consumes nothing new — Kafka remembers the group's offset. For a
+clean replay: `make down && make up`, bump `group-id`, restart the consumer.
 
 ---
 
 ## Layout
 
 ```
-tools/
-  extract_events.py   git history -> JSONL change events
-  publish_events.py   JSONL -> Kafka, keyed by document path
-  audit_corpus.py     score a repo on whether it's a useful corpus
-ingest-consumer/      Spring Boot consumer, ordering verification, stats
-docker-compose.yml    single-node Kafka (KRaft) + Kafka UI
-Makefile              every command above
+tools/               extract_events, export_blobs, publish_events, audit_corpus
+ingest-consumer/
+  parse/             DocumentParser, MarkdownParser, DocumentParsers
+  normalize/         ContentNormalizer, OpaqueUrlNormalizer, NormalizedContent
+  chunk/             Chunker, ChunkPipeline, ChunkHasher, HashedChunk, SeenChunks
+  consumer/          Kafka listener
+  stats/             OrderingTracker, ReplayStats
+  web/               GET /stats
+docker-compose.yml   single-node Kafka (KRaft) + UI
 ```
+
+MIT

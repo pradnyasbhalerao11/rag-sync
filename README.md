@@ -15,7 +15,7 @@ This is the write path: the part that notices a change and applies it correctly.
 - **Orphaned chunks** — a 12-chunk document is rewritten into 9; upsert the 9 and
   chunks 10–12 stay retrievable forever
 - **Deletes that don't propagate** — source document removed, embeddings remain
-- **Embedding model skew** — new vectors land in a different space from old ones
+- **Embedding model skew** — new vectors sit in a different space from old ones
 - **Poison documents** — one bad file stalls a Kafka partition silently
 
 ---
@@ -24,7 +24,7 @@ This is the write path: the part that notices a change and applies it correctly.
 
 - [x] Event transport — git history → Kafka, ordered per document
 - [x] Chunking and dedupe — parse, normalize, chunk, content-hash
-- [ ] Embeddings and vector index
+- [x] Embeddings and vector store — pluggable provider, pluggable store
 - [ ] Delete propagation and orphan sweep
 - [ ] Dead-letter topic and reconciler
 - [ ] Embedding model migration by replay
@@ -34,54 +34,57 @@ This is the write path: the part that notices a change and applies it correctly.
 ## Architecture
 
 ```
-  git repo
-     │  extract_events.py          export_blobs.py
-     ▼                                    │
-  doc.changes  (Kafka, keyed by doc path) │
-     │                                    ▼
-     ▼                              data/blobs/  (content-addressed)
-  ┌──────────────────────────────────────────────┐
-  │  ingest consumer                             │
-  │                                              │
-  │   parse       DocumentParsers ──┐            │
-  │                                 ├─ .md → MarkdownParser
-  │                                 └─ *  → passthrough
-  │      ▼                                       │
-  │   normalize   OpaqueUrlNormalizer            │
-  │                  opaque URL → §link0§        │
-  │                  original kept in metadata   │
-  │      ▼                                       │
-  │   chunk       Chunker                        │
-  │                  headings → paragraphs → cap │
-  │      ▼                                       │
-  │   hash        embedHash   = text             │
-  │               contentHash = text + links     │
-  └──────────────────────────────────────────────┘
-     │
-     ▼
-  vector index  →  RAG app (out of scope)
+  git repository
+     │  extract_events.py           export_blobs.py
+     ▼                                     │
+  doc.changes  (Kafka, keyed by doc path)  │
+     │                                     ▼
+     ▼                               data/blobs/   (content-addressed)
+  ┌───────────────────────────────────────────────┐
+  │  ingest consumer                              │
+  │                                               │
+  │   parse       DocumentParsers                 │
+  │                 .md → MarkdownParser          │
+  │                 *   → passthrough             │
+  │      ▼                                        │
+  │   normalize   opaque URL → placeholder        │
+  │                 original kept as metadata     │
+  │      ▼                                        │
+  │   chunk       headings → paragraphs → cap     │
+  │      ▼                                        │
+  │   hash        embedHash   = text              │
+  │               contentHash = text + links      │
+  │      ▼                                        │
+  │   embed       EmbeddingProvider               │
+  │                 ollama | azure                │
+  │      ▼                                        │
+  │   store       VectorStore                     │
+  │                 pgvector | ...                │
+  └───────────────────────────────────────────────┘
 ```
+
+Nothing above the store is in scope. This is infrastructure — no user logs into
+it.
 
 ---
 
-## From markdown-specific to pluggable
+## Pluggable by design
 
-The first chunker knew exactly one rule: split on markdown `#` headings. Running
-it against other corpora showed the limit — **28 of 138 Prometheus docs and 29 of
-150 JUnit Java files have no headings at all**, so each became a single chunk and
-fell through to a blind character cut.
+Two seams, each selected by one config line. `@ConditionalOnProperty` means
+exactly one bean of each type exists, and the pipeline never learns which.
 
-The fix was not a smarter markdown chunker. It was a seam:
-
-```
-DocumentParsers.extractText(raw, path)
-        ├── .md  → MarkdownParser   (strips frontmatter)
-        └── else → passthrough
+```yaml
+app:
+  embedding:
+    provider: ollama        # ollama | azure
+  store:
+    provider: pgvector      # pgvector | ...
 ```
 
-Adding PDF or HTML later means adding one `DocumentParser`, not editing the
-chunker. The block-model abstraction is deliberately deferred until a second
-format actually needs it.
+The same pattern handles document formats. The first chunker knew one rule —
+split on markdown headings — and measuring showed the limit: on other corpora,
+**20% of files have no headings at all** and became a single chunk. The fix was a
+parser seam rather than a cleverer markdown chunker.
 
 ---
 
@@ -89,17 +92,17 @@ format actually needs it.
 
 Two stages run **before** chunking.
 
-**Parse** — what is the text in this file? For markdown, strip the YAML
-frontmatter; `title: X / outline: deep` is metadata, not prose.
+**Parse** — what is the text in this file? For markdown, strip YAML frontmatter;
+`title: X / outline: deep` is metadata, not prose.
 
-**Normalize** — what should the embedding model see? The corpus contains
-generated permalinks up to **2,655 characters**, entirely base64 on one line. The
-chunker had nothing to split them on, so it hard-cut at the size cap and emitted
-fragments like `XG4gICAgPlxuICAgICAge3sgaXRlbS5tc2c`. Those embed without error,
-cost real money, and produce meaningless vectors that can still be the nearest
-match to a user's query.
+**Normalize** — what should the embedding model see? Documentation routinely
+embeds generated permalinks: one in the test corpus is **2,655 characters** of
+base64 on a single line. The chunker had nothing to split it on, so it hard-cut
+at the size cap and emitted meaningless fragments. Those embed without error,
+cost real calls, and produce vectors that can still be the nearest match to a
+user's query.
 
-Detection requires all three conditions, deliberately:
+Detection requires all three conditions:
 
 1. it is a URL
 2. its fragment or query is ≥ 200 characters
@@ -117,14 +120,14 @@ changes.
 ## Two hashes
 
 ```
-embedHash   = sha256(normalized text)               → need a new vector?
-contentHash = sha256(normalized text + links)       → need to rewrite the row?
+embedHash   = sha256(normalized text)           → need a new vector?
+contentHash = sha256(normalized text + links)   → need to rewrite the row?
 ```
 
 | what changed | embedHash | contentHash | cost |
 |---|---|---|---|
 | prose | changes | changes | embed + write |
-| only a URL | same | changes | write row, **reuse vector** |
+| only a URL | same | changes | write row, **copy the vector** |
 
 Neither hash includes chunk position. If it did, inserting a paragraph at the top
 of a document would make every chunk below look changed, collapsing reuse on
@@ -132,7 +135,10 @@ exactly the edits where it matters most.
 
 ---
 
-## Results — full replay of vuejs/docs
+## Results
+
+Full replay of a public documentation repository — 3,726 change events across
+347 distinct document paths:
 
 ```json
 {
@@ -147,35 +153,60 @@ exactly the edits where it matters most.
 }
 ```
 
-**`orderingViolations: 0`** across 347 documents — every document's edits, renames
-and deletes applied in commit order.
+**`orderingViolations: 0`** — every document's edits, renames and deletes applied
+in commit order.
 
 **`reuseRate: 0.776`** — 37,084 of 47,760 chunks were byte-identical to one
 already seen, so 78% of embedding work is avoidable.
 
-Normalization cut chunks from 52,255 to 47,760 and embedding calls from 11,239 to
-10,676, keeping ~470 base64 vectors out of the index entirely.
+Normalization alone cut chunks from 52,255 to 47,760 and embedding calls from
+11,239 to 10,676, keeping ~470 base64 vectors out of the store entirely.
 
 ---
 
 ## Running it
 
-```bash
-conda activate ragsync
-pip install -r tools/requirements.txt
-git clone https://github.com/vuejs/docs ../vuejs-docs
+Requires Docker, Java 17+, Maven, Python 3.10+, and [Ollama](https://ollama.com).
 
-make test                          # 30 unit tests, no infrastructure
-make up && make topic
-make extract REPO=../vuejs-docs    # git history → data/events.jsonl
-make export  REPO=../vuejs-docs    # document bytes → data/blobs/
-make consumer                      # Spring Boot, blocks
-make publish                       # another shell
-make stats
+```bash
+conda create -n ragsync python=3.12 -y && conda activate ragsync
+pip install -r tools/requirements.txt
+
+ollama pull nomic-embed-text
+make ollama-check                    # expects 768 dimensions
+
+make test                            # unit tests, no infrastructure
+make up                              # kafka + postgres
+make topic
+make db-init                         # pgvector extension, schema, indexes
+
+make audit   REPO=../docs-corpus     # is this corpus worth using?
+make extract REPO=../docs-corpus     # git history → data/events.jsonl
+make export  REPO=../docs-corpus     # document bytes → data/blobs/
+make consumer                        # Spring Boot, blocks
+make publish                         # another shell
+make count && make stats
 ```
 
-Re-running consumes nothing new — Kafka remembers the group's offset. For a
-clean replay: `make down && make up`, bump `group-id`, restart the consumer.
+Three pieces of state lie to you independently on a re-run: the Kafka topic
+(`make down`), the consumer group offset (bump `group-id`), and the in-memory
+counters (restart the consumer).
+
+---
+
+## Choosing a corpus
+
+Any git repository works — the extractor reads commit metadata, not file
+contents, so format is irrelevant at that stage.
+
+`make audit REPO=<path>` scores a candidate on licence, document count, churn,
+delete rate and rename count. A corpus where nothing is ever deleted can never
+surface the orphaned-chunk bug, and a repository with no licence file grants no
+redistribution rights — fine to read locally, not fine to publish anything
+derived from.
+
+No corpus is included in this repository. `data/` is gitignored: the event
+stream, blob store and vector rows are all regenerated by the commands above.
 
 ---
 
@@ -186,11 +217,14 @@ tools/               extract_events, export_blobs, publish_events, audit_corpus
 ingest-consumer/
   parse/             DocumentParser, MarkdownParser, DocumentParsers
   normalize/         ContentNormalizer, OpaqueUrlNormalizer, NormalizedContent
-  chunk/             Chunker, ChunkPipeline, ChunkHasher, HashedChunk, SeenChunks
+  chunk/             Chunker, ChunkPipeline, ChunkHasher, HashedChunk
+  embed/             EmbeddingProvider, Ollama…, Azure…, EmbeddingMetrics
+  store/             VectorStore, PgVectorStore, IndexedChunk, ChunkId
   consumer/          Kafka listener
   stats/             OrderingTracker, ReplayStats
   web/               GET /stats
-docker-compose.yml   single-node Kafka (KRaft) + UI
+  resources/db/      schema.sql
+docker-compose.yml   Kafka (KRaft) + UI + Postgres/pgvector
 ```
 
 MIT

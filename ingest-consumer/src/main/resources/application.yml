@@ -9,6 +9,26 @@ app:
   chunk:
     target-size: 1000
     max-size: 1500
+  # --- week 3 -------------------------------------------------------------
+  # Both providers are swapped by config alone. Nothing else in the pipeline
+  # knows which is running.
+  embedding:
+    provider: ollama              # ollama | azure
+    dimensions: 768               # MUST match the vector(N) width in schema.sql
+    batch-size: 16
+    max-attempts: 4
+    ollama:
+      base-url: http://localhost:11434
+      model: nomic-embed-text
+    azure:
+      endpoint: ${FOUNDRY_ENDPOINT:}
+      api-key: ${FOUNDRY_API_KEY:}
+      deployment: ${FOUNDRY_EMBEDDING_DEPLOYMENT:text-embedding-3-small}
+      api-version: ${FOUNDRY_API_VERSION:2024-02-01}
+  store:
+    provider: pgvector            # pgvector | (azure-search, later)
+    batch-size: 200
+
   normalize:
     # A URL fragment or query must be at least this long AND almost entirely
     # encoding-alphabet characters before it is treated as opaque. Both
@@ -20,10 +40,16 @@ app:
 spring:
   application:
     name: ingest-consumer
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ragsync
+    username: ragsync
+    password: ragsync
+    hikari:
+      maximum-pool-size: 10
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
-      group-id: ingest-consumer-v3
+      group-id: ingest-consumer-v4
       auto-offset-reset: earliest
       # manual commits only: the offset moves when we say the work is done,
       # not when the poll loop happens to come around again
@@ -39,9 +65,14 @@ spring:
         max.poll.records: 500
     listener:
       ack-mode: manual
-      concurrency: 3
+      # Dropped to 1 for the first embedding run. Three threads triple the
+      # request rate into a model whose throughput you have not measured yet,
+      # and a slower run is easier to reason about than intermittent failures.
+      # Raise it once you know what Ollama sustains on your machine.
+      concurrency: 1
 
 logging:
   level:
     com.ragsync.ingest: INFO
+    org.springframework.jdbc: WARN
     org.apache.kafka: WARN

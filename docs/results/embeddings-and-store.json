@@ -1,0 +1,45 @@
+{
+    "pipeline": {
+        "totalEvents": 3726,
+        "eventsByOp": {
+            "delete": 227,
+            "upsert": 3499
+        },
+        "distinctDocuments": 347,
+        "eventsByPartition": {
+            "0": 813,
+            "1": 828,
+            "2": 496,
+            "3": 509,
+            "4": 554,
+            "5": 526
+        },
+        "orderingViolations": 0,
+        "deserializationFailures": 0,
+        "documentsChunked": 3499,
+        "chunksTotal": 47760,
+        "chunksNew": 10670,
+        "chunksReused": 37090,
+        "rowsWritten": 10816,
+        "vectorsReusedAcrossLinks": 146,
+        "reuseRate": 0.777,
+        "blobMisses": 0,
+        "elapsedMillis": 307270
+    },
+    "embedding": {
+        "embeddingCalls": 3438,
+        "textsEmbedded": 10670,
+        "vectorsCopiedFromStore": 146,
+        "retries": 0,
+        "failures": 0,
+        "meanCallMillis": 78,
+        "p50CallMillis": 45,
+        "p95CallMillis": 279,
+        "totalEmbeddingMillis": 271101
+    },
+    "store": {
+        "model": "nomic-embed-text",
+        "dimensions": 768,
+        "rowsInStore": 10815
+    }
+}
